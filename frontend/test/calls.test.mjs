@@ -61,7 +61,7 @@ test('a new call is taken, also right after an ended one', () => {
   assert.equal(callReducer(s, { type: 'call', call: null }), s)
   assert.equal(callReducer(s, { type: 'call', call: { seq: 3, state: 'active' } }), s)
   assert.equal(callReducer(noCall, dismiss), noCall)
-  // A call without seq (an older service) is still taken as the newer copy.
+  // A call without seq is still taken as the newer copy.
   assert.equal(run(ev('a', 2, 'joining'), { type: 'call', call: { id: 'a', state: 'active' } }).call.state, 'active')
 })
 

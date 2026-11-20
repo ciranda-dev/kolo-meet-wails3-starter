@@ -2,7 +2,7 @@
 # Writes a release version into the packaging files of a copy of the app: build/config.yml, both Info.plist files,
 # the deb, the Windows version info, manifests and MSIX files, and the NSIS defaults. The files in git keep the
 # placeholder 0.0.0, so only a release copy carries a version.
-# Usage: scripts/stamp-version.sh VERSION [DIR]    VERSION is a git tag such as v0.1.5 or v0.1.5-3-gabc1234.
+# Usage: scripts/stamp-version.sh VERSION [DIR]    VERSION is a git tag such as v0.1.0 or v0.1.0-3-gabc1234.
 set -euo pipefail
 
 version=${1:?usage: stamp-version.sh VERSION [DIR]}

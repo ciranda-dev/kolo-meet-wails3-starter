@@ -144,7 +144,7 @@ func TestTaskfileVersionWithoutGit(t *testing.T) {
 	if m == nil {
 		t.Fatal("the Taskfile has no VERSION command")
 	}
-	for env, want := range map[string]string{"v0.1.6": "0.1.6", "0.1.6": "0.1.6", "": "dev"} {
+	for env, want := range map[string]string{"v1.2.3": "1.2.3", "1.2.3": "1.2.3", "": "dev"} {
 		dir := t.TempDir()
 		cmd := exec.Command(bash, "-ec", string(m[1]))
 		cmd.Dir = dir
@@ -175,10 +175,10 @@ func TestReleaseFindsTheVersionInABinary(t *testing.T) {
 		ver, body string
 		want      bool
 	}{
-		"injected":      {"0.1.6", "\x00\x00go1.26\x00\x000.1.6\x00\x00", true},
-		"module only":   {"0.1.6", "github.com/ciranda-dev/kolo-dht\tv0.1.6\th1:abc", false},
-		"other version": {"0.1.6", "\x00\x000.1.5\x00", false},
-		"dirty":         {"0.1.6-dirty", "\x000.1.6-dirty\x00", true},
+		"injected":      {"1.2.3", "\x00\x00go1.26\x00\x001.2.3\x00\x00", true},
+		"module only":   {"1.2.3", "github.com/ciranda-dev/kolo-dht\tv1.2.3\th1:abc", false},
+		"other version": {"1.2.3", "\x00\x001.2.2\x00", false},
+		"dirty":         {"1.2.3-dirty", "\x001.2.3-dirty\x00", true},
 	} {
 		f := filepath.Join(dir, strings.ReplaceAll(name, " ", "-"))
 		if err := os.WriteFile(f, []byte(tc.body), 0o644); err != nil {

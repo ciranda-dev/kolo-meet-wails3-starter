@@ -9,7 +9,7 @@ The starting point of the "Build a video call app" guide in the [Kolo docs](http
 
 ## Run it
 
-You need Go 1.26 or later, Node.js with npm, and the Wails 3 CLI (`go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0`). Every Kolo library comes from a published version (among them kolo-media v0.1.4, kolo-moq v0.1.5, kolo-audio v0.1.6, kolo-video v0.1.2 and kolo-swarm v0.1.7), so `GOWORK=off` builds work.
+You need Go 1.26 or later, Node.js with npm, and the Wails 3 CLI (`go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0`). Every Kolo library comes from a published version in `go.mod`, so `GOWORK=off` builds work.
 
 ```sh
 GOWORK=off wails3 build                 # build bin/kolo-meet
