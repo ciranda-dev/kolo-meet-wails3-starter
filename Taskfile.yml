@@ -1,0 +1,43 @@
+version: '3'
+
+vars:
+  APP_NAME: "kolo-meet"
+  BIN_DIR: "bin"
+  PACKAGE_MANAGER: '{{.PACKAGE_MANAGER | default "npm"}}'
+  VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
+  # Target OS for build/package/run. Defaults to the host OS, and is overridden
+  # by `wails3 build GOOS=...` (or the GOOS env var) for cross-compilation. The
+  # tasks below dispatch to the matching platform Taskfile via this variable.
+  GOOS: '{{.GOOS | default OS}}'
+  # The app version, built into the binary with -ldflags: KOLO_VERSION, else the git tag, else "dev" (also in a copy
+  # without .git). A dev build (DEV=true) does not set it, so it says "dev". Task runs this with errexit and expands
+  # a ${X:-$(cmd)} default even when X is set, so a failing git must not end the command.
+  VERSION:
+    sh: 'v=${KOLO_VERSION:-}; [ -n "$v" ] || v=$(git describe --tags --always --dirty 2>/dev/null) || v=; v=${v#v}; echo "${v:-dev}"'
+
+includes:
+  common: ./build/Taskfile.yml
+  windows: ./build/windows/Taskfile.yml
+  darwin: ./build/darwin/Taskfile.yml
+  linux: ./build/linux/Taskfile.yml
+
+tasks:
+  build:
+    summary: Builds the application
+    cmds:
+      - task: "{{.GOOS}}:build"
+
+  package:
+    summary: Packages a production build of the application
+    cmds:
+      - task: "{{.GOOS}}:package"
+
+  run:
+    summary: Runs the application
+    cmds:
+      - task: "{{.GOOS}}:run"
+
+  dev:
+    summary: Runs the application in development mode
+    cmds:
+      - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}

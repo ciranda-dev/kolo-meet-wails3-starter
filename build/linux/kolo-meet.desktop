@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Kolo Meet
+Comment=Video calls between people, built with Kolo
+Exec=kolo-meet %u
+Icon=kolo-meet
+Terminal=false
+Categories=Network;VideoConference;
+StartupWMClass=kolo-meet
