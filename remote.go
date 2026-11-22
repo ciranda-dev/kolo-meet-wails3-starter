@@ -100,11 +100,22 @@ func (c *call) logMedia(ctx context.Context, p *participant, w *kolomedia.Watche
 		st, ss := w.Stats(), c.session().Stats()
 		q0 = c.reportRemote(p, st, q0, secs, now)
 		au, vi := st.Playout.Tracks["audio"], st.Playout.Tracks["video"]
-		c.logf("media from %.8s: audio %.1f/s video %.1f/s (missed %d, made up %d); playout delay %v, audio %s, video %s; session reset %d expired %d; track errors audio %v video %v",
-			p.id, float64(a-a0)/secs, float64(v-v0)/secs, p.missed.Load(), p.concealed.Load(), st.Playout.Delay, trackLine(au, st.Audio), trackLine(vi, st.Video),
+		c.mu.Lock()
+		mic, cam := onOff(p.audioOn), onOff(p.videoOn)
+		c.mu.Unlock()
+		c.logf("media from %.8s (microphone %s, camera %s): audio %.1f/s video %.1f/s (missed %d, made up %d); playout delay %v, audio %s, video %s; session reset %d expired %d; track errors audio %v video %v",
+			p.id, mic, cam, float64(a-a0)/secs, float64(v-v0)/secs, p.missed.Load(), p.concealed.Load(), st.Playout.Delay, trackLine(au, st.Audio), trackLine(vi, st.Video),
 			ss.ResetGroups, ss.ExpiredGroups, st.Audio.Err, st.Video.Err)
 		a0, v0, t0 = a, v, now
 	}
+}
+
+// onOff names a device state of a sender's catalog: a track exists while its device is on.
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
 
 // reportRemote writes the quality record of p for the interval since q0 and returns the counters it read.
@@ -155,11 +166,18 @@ func trackLine(p kolomedia.TrackStats, w kolomedia.TrackWatchStats) string {
 		p.Received, p.Played, p.Late, p.Skipped, p.Ahead, p.Overflow, p.Duplicate, p.NoKeyframe, p.Buffered, w.Dropped, w.Gaps, w.Malformed, w.NoKey, w.Retired, w.Unauthenticated)
 }
 
+// watchSampled is a test seam: it is told the counters of a watch each time pollCatalog reads them.
+var watchSampled func(c *call, p *participant, st kolomedia.WatchStats)
+
 // pollCatalog keeps p.audioOn and p.videoOn, which come from the catalog the sender sealed: a track exists while its
 // device is on.
 func (c *call) pollCatalog(ctx context.Context, p *participant, w *kolomedia.Watcher) {
 	for {
-		tracks := w.Stats().Playout.Tracks
+		st := w.Stats()
+		if watchSampled != nil {
+			watchSampled(c, p, st)
+		}
+		tracks := st.Playout.Tracks
 		p.audioRecv.Store(tracks["audio"].Received)
 		p.videoRecv.Store(tracks["video"].Received)
 		cat := w.Catalog()

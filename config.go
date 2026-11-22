@@ -27,10 +27,11 @@ const (
 	defaultMaxParticipants = 8
 	maxParticipantsCeiling = 20
 	defaultFindTimeout     = time.Minute
-	// relayFindTimeout is the default with connection relays: kolo-swarm tries the relays only after kolo-dht's
-	// Connect failed, which takes up to its 3 relays (kolo-dht kolodht.go:31) times PunchTimeout 45 s
-	// (kolo-dht config.go:43, 135), and one relay dial takes up to 60 s (decision 0013, "Dial").
-	relayFindTimeout      = 3*45*time.Second + 60*time.Second
+	// relayFindTimeout is the default with connection relays: kolo-swarm tries the relays once kolo-dht's Connect failed
+	// or ran for its punch window of two consistent mappings, 10 probes 1 s apart plus twice RequestTimeout of 1 s
+	// (kolo-swarm relay.go relayAfterLocked, kolo-dht punch.go consistentWindow), and one relay dial takes up to 60 s
+	// (decision 0013, "Dial"; decision 0021).
+	relayFindTimeout      = 12*time.Second + 60*time.Second
 	defaultLookupInterval = 5 * time.Second
 	localListen           = "127.0.0.1:0"
 	publicListen          = "0.0.0.0:0"
@@ -79,7 +80,7 @@ type Config struct {
 	First           string        // -first, KOLO_MEET_FIRST: run the first entry node of a local test network on this loopback IP:PORT
 	Listen          string        // -listen, KOLO_MEET_LISTEN. Default 127.0.0.1:0 on a loopback network, else 0.0.0.0:0
 	MaxParticipants int           // -max-participants, KOLO_MEET_MAX_PARTICIPANTS: people in one call, you included. Default 8, at most 20
-	FindTimeout     time.Duration // -find-timeout, KOLO_MEET_FIND_TIMEOUT: how long a join looks for the host. Default 1m, 195s with connection relays
+	FindTimeout     time.Duration // -find-timeout, KOLO_MEET_FIND_TIMEOUT: how long a join looks for the host. Default 1m, 72s with connection relays
 	LookupInterval  time.Duration // -lookup-interval, KOLO_MEET_LOOKUP_INTERVAL: time between lookups of a topic. Default 5s
 	// Relays and RelayFiles are the connection relays: -relay (repeatable, a comma list of host:port@key) and
 	// -relay-file (repeatable), or KOLO_MEET_RELAYS when neither flag is given.
@@ -154,7 +155,7 @@ func LoadConfig(args []string, getenv func(string) string, stderr io.Writer) (Co
 		{"first", "KOLO_MEET_FIRST", "run the first entry node of a local test network on this loopback IP:PORT, such as 127.0.0.1:4000", text(&c.First)},
 		{"listen", "KOLO_MEET_LISTEN", "local IP:PORT (default 127.0.0.1:0 on a loopback network, else 0.0.0.0:0)", text(&c.Listen)},
 		{"max-participants", "KOLO_MEET_MAX_PARTICIPANTS", "people in one call, you included (default 8, at most 20)", count("max-participants", &c.MaxParticipants)},
-		{"find-timeout", "KOLO_MEET_FIND_TIMEOUT", "how long a join looks for the host (default 1m, 195s with connection relays)", dur(&c.FindTimeout)},
+		{"find-timeout", "KOLO_MEET_FIND_TIMEOUT", "how long a join looks for the host (default 1m, 72s with connection relays)", dur(&c.FindTimeout)},
 		{"lookup-interval", "KOLO_MEET_LOOKUP_INTERVAL", "time between lookups of a topic (default 5s)", dur(&c.LookupInterval)},
 		{"video-size", "KOLO_MEET_VIDEO_SIZE", "ceiling of the picture and the camera size asked for, WxH, at most 1920x1080; the ladder sends less when the path, the processor or the call needs it (default 1920x1080)", text(&c.VideoSize)},
 		{"video-bitrate", "KOLO_MEET_VIDEO_BITRATE", "VP8 bits a second at -video-size, scaled with the pixels for each rung below it (default kolo-video's 0.07 bits per pixel per frame, at most 3800000: 3800000 at 1920x1080, 1935360 at 1280x720, 483840 at 640x360)", count("video-bitrate", &c.VideoBitrate)},

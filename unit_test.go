@@ -678,7 +678,7 @@ func TestHelpNamesTheFindTimeoutWithRelays(t *testing.T) {
 	if _, err := LoadConfig([]string{"-h"}, func(string) string { return "" }, &out); !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("err: %v", err)
 	}
-	if !strings.Contains(out.String(), "default 1m, 195s with connection relays") || relayFindTimeout != 195*time.Second {
+	if !strings.Contains(out.String(), "default 1m, 72s with connection relays") || relayFindTimeout != 72*time.Second {
 		t.Errorf("help: %s", out.String())
 	}
 	if strings.Contains(out.String(), "Settings") {

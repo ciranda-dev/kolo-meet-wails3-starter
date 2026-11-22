@@ -5,6 +5,7 @@ import (
 	"time"
 
 	kolomoq "github.com/ciranda-dev/kolo-moq"
+	kolotransport "github.com/ciranda-dev/kolo-transport"
 )
 
 // What the sender watches and how it answers. The delays are the app's choices: the receivers play a frame up to
@@ -20,10 +21,12 @@ const (
 	// cutEvery spaces the cuts of the bitrate: a queue empties slowly after one, and cutting on every tick would
 	// drive the rate to its floor.
 	cutEvery = time.Second
-	// clearFor is how long the path must stay clear before the bitrate grows again, and growStep how much it grows
-	// each adaptEvery: 5% of the full rate a second.
+	// clearFor is how long the path must stay clear before the bitrate grows again. It then grows each adaptEvery by
+	// growStep of the full rate (5% a second) or by rampUp a second of its own rate, whichever is more: 8% a second, the
+	// increase of a rate controller far from the capacity of its path.
 	clearFor = 3 * time.Second
 	growStep = 0.0125
+	rampUp   = 1.08
 	// minScale is the smallest share of a size's full bitrate; at 1280x720 it is about 100 kbit/s.
 	minScale = 0.05
 	// keepShare is the part of the measured throughput the video takes; the rest is for the audio and for what
@@ -43,6 +46,11 @@ type pathSample struct {
 	sent  uint64        // bytes handed to the transport, over all sessions
 	delay time.Duration // the oldest unsent object, the worst of the sessions
 	drops uint64        // groups reset or expired, over all sessions
+	// minRTT is the lowest round trip the transport saw: a throughput measured over less than one is no measure. bps is
+	// what the transport's congestion controller lets through, in bits a second: the bandwidth it measured, or its
+	// window over the round trip. Both are 0 until the transport has a sample.
+	minRTT time.Duration
+	bps    float64
 }
 
 // decision is what the publisher does until the next sample.
@@ -70,6 +78,13 @@ type adapter struct {
 	at      time.Time
 	cut     time.Time
 	clearAt time.Time
+	// warm is set once the first run of full ticks has ended, or clearFor after the first sample when none began by
+	// then: a run that begins that early is the first key frame on a cold transport window, which measures the window
+	// and not the path. runAt and runSent are when the current run of full ticks began and the bytes sent by then.
+	began   time.Time
+	warm    bool
+	runAt   time.Time
+	runSent uint64
 }
 
 func newAdapter() *adapter { return &adapter{scale: 1} }
@@ -77,15 +92,26 @@ func newAdapter() *adapter { return &adapter{scale: 1} }
 // step takes a sample made at now and the full bitrate of the size being sent, in bits a second, and says what to do.
 func (a *adapter) step(now time.Time, s pathSample, full float64) decision {
 	if a.at.IsZero() {
-		a.last, a.at, a.clearAt = s, now, now
+		a.last, a.at, a.clearAt, a.began = s, now, now, now
 		return decision{scale: a.scale}
 	}
 	dt := now.Sub(a.at).Seconds()
 	full = max(full, 1)
-	rate := float64(s.sent-a.last.sent) * 8 / max(dt, 0.001)
 	lost := s.drops > a.last.drops
 	busy := s.delay > congestedDelay
-	if busy {
+	switch {
+	case !busy:
+		a.warm = a.warm || !a.runAt.IsZero()
+		a.runAt = time.Time{}
+	case a.runAt.IsZero():
+		a.runAt, a.runSent = a.at, a.last.sent
+		a.warm = a.warm || a.at.Sub(a.began) >= clearFor
+	case !a.warm && now.Sub(a.runAt) >= clearFor:
+		// A first run that lasts this long is the path, not a key frame: it is measured from here.
+		a.warm, a.runAt, a.runSent = true, a.at, a.last.sent
+	}
+	if win := now.Sub(a.runAt); busy && a.warm && win >= s.minRTT {
+		rate := float64(s.sent-a.runSent) * 8 / max(win.Seconds(), 0.001)
 		if a.bps == 0 {
 			a.bps = rate
 		} else {
@@ -100,14 +126,23 @@ func (a *adapter) step(now time.Time, s pathSample, full float64) decision {
 	case (busy || lost) && now.Sub(a.cut) >= cutEvery:
 		a.cut, a.clearAt = now, now
 		next := a.scale * 0.8
-		if busy && a.bps > 0 {
+		switch {
+		case busy && a.bps > 0:
 			next = min(a.scale, (keepShare*a.bps-audioShare)/full)
+		case busy && s.bps > 0:
+			// No measure yet: follow what the transport lets through, and on the cold run no lower than the usual cut,
+			// since a new connection's window reads low.
+			if t := min(a.scale, (keepShare*s.bps-audioShare)/full); a.warm {
+				next = t
+			} else {
+				next = max(next, t)
+			}
 		}
 		a.scale = max(minScale, next)
 	case busy || lost:
 		a.clearAt = now
 	case now.Sub(a.clearAt) >= clearFor:
-		a.scale = min(1, a.scale+growStep)
+		a.scale = min(1, a.scale+max(growStep, a.scale*(math.Pow(rampUp, min(dt, 1))-1)))
 	}
 	d.scale = a.scale
 	return d
@@ -269,6 +304,9 @@ var noFair bool
 // rungChanged is a test seam: it is told each time the ladder of a call changes the rung, with the new rung and the reason.
 var rungChanged func(c *call, r rung, why string)
 
+// pathDecided is a test seam: it is told what the adapter of a call decided at each tick, after the ladder's step.
+var pathDecided func(c *call, d decision)
+
 // adaptLoop keeps the publisher's video within what the path carries until the call ends.
 func (c *call) adaptLoop() {
 	if noAdapt {
@@ -292,7 +330,8 @@ func (c *call) adaptLoop() {
 			for _, sess := range sessions {
 				st := sess.Stats()
 				ss = append(ss, sessionSample{id: sess, queued: st.QueuedBytes > 0,
-					sample: pathSample{sent: st.SentBytes, delay: st.QueueDelay, drops: st.ResetGroups + st.ExpiredGroups}})
+					sample: pathSample{sent: st.SentBytes, delay: st.QueueDelay, drops: st.ResetGroups + st.ExpiredGroups,
+						minRTT: st.Transport.MinRTT, bps: transportRate(st.Transport)}})
 			}
 			if noFair {
 				ss = mergeSamples(ss)
@@ -324,6 +363,9 @@ func (c *call) adaptLoop() {
 				}
 			}
 			pub.setPath(d)
+			if pathDecided != nil {
+				pathDecided(c, d)
+			}
 		}
 	}
 }
@@ -339,10 +381,29 @@ func mergeSamples(ss []sessionSample) []sessionSample {
 		m.sample.sent += x.sample.sent
 		m.sample.delay = max(m.sample.delay, x.sample.delay)
 		m.sample.drops += x.sample.drops
+		m.sample.minRTT = max(m.sample.minRTT, x.sample.minRTT)
+		m.sample.bps += x.sample.bps
 		m.queued = m.queued || x.queued
 	}
 	return []sessionSample{m}
 }
+
+// transportRate is what the congestion controller of a connection lets through, in bits a second: the congestion window
+// over the smoothed round trip, and for BBR, whose window is twice what its bandwidth needs and whose bandwidth reads low
+// while little was sent, the larger of half that and its bandwidth. 0 before the first sample.
+func transportRate(st kolotransport.ConnStats) float64 {
+	if st.SmoothedRTT <= 0 {
+		return float64(st.BandwidthEstimate) * 8
+	}
+	w := float64(st.CongestionWindow) * 8 / st.SmoothedRTT.Seconds()
+	if st.CongestionController == congestionBBR {
+		return max(float64(st.BandwidthEstimate)*8, w/bbrCwndGain)
+	}
+	return w
+}
+
+// bbrCwndGain is the factor of BBR's congestion window over the path's bandwidth-delay product.
+const bbrCwndGain = 2
 
 func skipNote(d decision) string {
 	switch {

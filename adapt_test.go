@@ -5,6 +5,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	kolotransport "github.com/ciranda-dev/kolo-transport"
 )
 
 // The bitrate follows the path: it falls to a share of the throughput measured while the path is full, never goes
@@ -23,6 +25,8 @@ func TestAdapterFollowsThePath(t *testing.T) {
 	if d := step(2e6, 0, 0); d.scale != 1 || d.key || d.skip {
 		t.Fatalf("first sample: %+v", d)
 	}
+	coldRun(a, &now, &s, full)
+	a.scale = 1
 	// The path carries 1 Mbit/s and the queue grows: the rate comes down to 75% of it minus the audio's share.
 	var d decision
 	for range 8 {
@@ -175,5 +179,159 @@ func TestLossWatch(t *testing.T) {
 	now = now.Add(2 * time.Second)
 	if got := l.step(now, 42); got != 0 {
 		t.Fatalf("loss %d after lossHold with none seen", got)
+	}
+}
+
+// coldRun gives a new adapter its first run of full ticks, which it does not measure, and a clear tick that ends it.
+func coldRun(a *adapter, now *time.Time, s *pathSample, full float64) {
+	for _, delay := range []time.Duration{0, 400 * time.Millisecond, 400 * time.Millisecond, 0} {
+		*now = now.Add(adaptEvery)
+		s.delay = delay
+		a.step(*now, *s, full)
+	}
+}
+
+// The first key frame on a cold transport window fills the queue while the window, not the path, sets how much leaves:
+// that run gives no estimate of the path, and its cuts follow what the transport lets through, but no lower than the
+// usual cut, since a new window reads low.
+func TestAdapterIgnoresTheColdKeyFrame(t *testing.T) {
+	const full = 1_900_000.0
+	for _, c := range []struct {
+		bps, want float64
+	}{
+		{2.5e6, (keepShare*2.5e6 - audioShare) / full}, // the transport carries more than the usual cut leaves
+		{0.2e6, 0.8 * 0.8}, // a cold window: two usual cuts in 1.5 s, not the window's 0.2 Mbit/s
+	} {
+		a := newAdapter()
+		now := time.Unix(1000, 0)
+		s := pathSample{minRTT: 470 * time.Millisecond, bps: c.bps}
+		a.step(now, s, full)
+		var d decision
+		for range 6 { // 1.5 s of a full queue, 15 kbit/s leaving
+			now = now.Add(adaptEvery)
+			s.sent += uint64(15e3 / 8 * adaptEvery.Seconds())
+			s.delay = 600 * time.Millisecond
+			d = a.step(now, s, full)
+			if d.est != 0 {
+				t.Fatalf("an estimate of %.0f bit/s from the cold window", d.est)
+			}
+		}
+		if d.scale > c.want*1.02 || d.scale < c.want*0.98 {
+			t.Errorf("transport at %.0f bit/s: scale %.3f, want %.3f", c.bps, d.scale, c.want)
+		}
+	}
+	a := newAdapter()
+	now := time.Unix(1000, 0)
+	s := pathSample{minRTT: 470 * time.Millisecond, bps: 1e6}
+	a.step(now, s, full)
+	for range 6 {
+		now = now.Add(adaptEvery)
+		s.delay = 600 * time.Millisecond
+		a.step(now, s, full)
+	}
+	var d decision
+	// Once that run is over, a full queue measures the path.
+	now = now.Add(adaptEvery)
+	s.delay = 0
+	a.step(now, s, full)
+	for range 4 {
+		now = now.Add(adaptEvery)
+		s.sent += uint64(800e3 / 8 * adaptEvery.Seconds())
+		s.delay = 400 * time.Millisecond
+		d = a.step(now, s, full)
+	}
+	if d.est < 700e3 || d.est > 900e3 {
+		t.Fatalf("estimate %.0f bit/s after the cold run, want about 800 kbit/s", d.est)
+	}
+}
+
+// A throughput measured over less than a round trip is no measure: on a 500 ms path the bytes leave in bursts a round
+// trip apart, so a tick of 250 ms sees nothing or twice the rate. The estimate waits for a window of a round trip.
+func TestAdapterMeasuresOverARoundTrip(t *testing.T) {
+	const full = 1_900_000.0
+	a := newAdapter()
+	now := time.Unix(1000, 0)
+	s := pathSample{minRTT: 500 * time.Millisecond}
+	a.step(now, s, full)
+	coldRun(a, &now, &s, full)
+	var ests []float64
+	for i := range 8 { // 1 Mbit/s: 62.5 KB every other tick
+		now = now.Add(adaptEvery)
+		if i%2 == 0 {
+			s.sent += 62_500
+		}
+		s.delay = 400 * time.Millisecond
+		ests = append(ests, a.step(now, s, full).est)
+	}
+	if ests[0] != 0 {
+		t.Fatalf("an estimate of %.0f bit/s after half a round trip", ests[0])
+	}
+	for _, e := range ests[1:] {
+		if e < 0.8e6 || e > 1.4e6 {
+			t.Fatalf("estimates %v, want about 1 Mbit/s once the window is a round trip", ests)
+		}
+	}
+}
+
+// Clear for long enough, a rate high in its range grows by 8% of itself a second, faster than the 5% of the full rate
+// it grows by at the bottom.
+func TestAdapterRampsUpByEightPercentASecond(t *testing.T) {
+	const full = 1_900_000.0
+	a := newAdapter()
+	now := time.Unix(1000, 0)
+	var s pathSample
+	a.step(now, s, full)
+	a.scale = 0.8
+	var d decision
+	for range int(clearFor/adaptEvery) + 1 {
+		now = now.Add(adaptEvery)
+		d = a.step(now, s, full)
+	}
+	from := d.scale
+	for range int(time.Second / adaptEvery) {
+		now = now.Add(adaptEvery)
+		d = a.step(now, s, full)
+	}
+	if got, want := d.scale/from, 1.08; got < want-0.005 || got > want+0.005 {
+		t.Fatalf("grew by %.3f in a second from %.3f, want %.2f", got, from, want)
+	}
+}
+
+// What the transport lets through, in bits a second: the window over the round trip, and for BBR the larger of its
+// bandwidth and half that, since its window is twice its bandwidth-delay product and its bandwidth reads low while
+// little was sent.
+func TestTransportRate(t *testing.T) {
+	ms := time.Millisecond
+	for _, c := range []struct {
+		st   kolotransport.ConnStats
+		want float64
+	}{
+		{kolotransport.ConnStats{CongestionController: "bbr", BandwidthEstimate: 125_000, CongestionWindow: 20_000, SmoothedRTT: 100 * ms}, 1e6},
+		{kolotransport.ConnStats{CongestionController: "bbr", BandwidthEstimate: 10_000, CongestionWindow: 125_000, SmoothedRTT: 500 * ms}, 1e6},
+		{kolotransport.ConnStats{CongestionController: "reno", CongestionWindow: 62_500, SmoothedRTT: 500 * ms}, 1e6},
+		{kolotransport.ConnStats{CongestionController: "reno", CongestionWindow: 62_500}, 0},
+	} {
+		if got := transportRate(c.st); got != c.want {
+			t.Errorf("%+v: %.0f, want %.0f", c.st, got, c.want)
+		}
+	}
+}
+
+// A first run of a full queue that lasts longer than a key frame can is the path: it is measured from then on.
+func TestAdapterMeasuresALongFirstRun(t *testing.T) {
+	const full = 1_900_000.0
+	a := newAdapter()
+	now := time.Unix(1000, 0)
+	s := pathSample{minRTT: 100 * time.Millisecond}
+	a.step(now, s, full)
+	var d decision
+	for range int(clearFor/adaptEvery) + 4 { // 600 kbit/s leaving a full queue from the start
+		now = now.Add(adaptEvery)
+		s.sent += uint64(600e3 / 8 * adaptEvery.Seconds())
+		s.delay = 400 * time.Millisecond
+		d = a.step(now, s, full)
+	}
+	if d.est < 500e3 || d.est > 700e3 {
+		t.Fatalf("estimate %.0f bit/s after a first run of %v, want about 600 kbit/s", d.est, clearFor+time.Second)
 	}
 }
