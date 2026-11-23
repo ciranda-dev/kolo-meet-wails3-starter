@@ -476,7 +476,7 @@ func testPublisher(t *testing.T, v videoMode) *publisher {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { sender.Close() })
-	bc, err := kolomedia.NewSecureBroadcast(origin, sender)
+	bc, err := kolomedia.NewSecureBroadcast(origin, sender, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
