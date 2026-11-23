@@ -123,8 +123,11 @@ func TestRelaySettingSources(t *testing.T) {
 		e, _ := relayEntry(t, fmt.Sprintf("127.0.0.1:%d", 8000+i))
 		sixteen = append(sixteen, e)
 	}
-	if s, err = resolve([]string{"-relay", strings.Join(sixteen[:16], ",")}, nil); err != nil || len(s.relays) != 16 {
-		t.Errorf("16 relays: %d %v", len(s.relays), err)
+	if s, err = resolve([]string{"-relay", strings.Join(sixteen, ",")}, nil); err != nil || len(s.relays) != 17 {
+		t.Errorf("17 relays: %d %v", len(s.relays), err)
+	}
+	if s, err = resolve([]string{"-relay-file", file, "-relay", strings.Join(sixteen[:16], ",")}, nil); err != nil || len(s.relays) != 17 {
+		t.Errorf("a file over 16 flags: %d %v", len(s.relays), err)
 	}
 	other, _ := relayEntry(t, "127.0.0.1:7001")
 	dir := t.TempDir()
@@ -136,19 +139,17 @@ func TestRelaySettingSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, args := range map[string][]string{
-		"17 relays":            {"-relay", strings.Join(sixteen, ",")},
-		"one key, two addrs":   {"-relay", a, "-relay", strings.Replace(a, "7001", "7009", 1)},
-		"one addr, two keys":   {"-relay", a + "," + other},
-		"IPv6":                 {"-relay", "[::1]:7001@" + hex.EncodeToString(ka)},
-		"IPv4-mapped":          {"-relay", "[::ffff:127.0.0.1]:7001@" + hex.EncodeToString(ka)},
-		"port 0":               {"-relay", "127.0.0.1:0@" + hex.EncodeToString(ka)},
-		"short key":            {"-relay", "127.0.0.1:7001@abcd"},
-		"no key":               {"-relay", "127.0.0.1:7001"},
-		"a link to /dev/zero":  {"-relay-file", zero},
-		"a directory":          {"-relay-file", dir},
-		"64 KiB and 1 byte":    {"-relay-file", big},
-		"flag and file clash":  {"-relay", strings.Replace(c, "relay.example.org", "127.0.0.9", 1), "-relay-file", file},
-		"file over the others": {"-relay-file", file, "-relay", sixteen[0] + "," + strings.Join(sixteen[1:16], ",")},
+		"one key, two addrs":  {"-relay", a, "-relay", strings.Replace(a, "7001", "7009", 1)},
+		"one addr, two keys":  {"-relay", a + "," + other},
+		"IPv6":                {"-relay", "[::1]:7001@" + hex.EncodeToString(ka)},
+		"IPv4-mapped":         {"-relay", "[::ffff:127.0.0.1]:7001@" + hex.EncodeToString(ka)},
+		"port 0":              {"-relay", "127.0.0.1:0@" + hex.EncodeToString(ka)},
+		"short key":           {"-relay", "127.0.0.1:7001@abcd"},
+		"no key":              {"-relay", "127.0.0.1:7001"},
+		"a link to /dev/zero": {"-relay-file", zero},
+		"a directory":         {"-relay-file", dir},
+		"64 KiB and 1 byte":   {"-relay-file", big},
+		"flag and file clash": {"-relay", strings.Replace(c, "relay.example.org", "127.0.0.9", 1), "-relay-file", file},
 	} {
 		_, err := resolve(args, nil)
 		var ce *ConfigError
@@ -189,16 +190,16 @@ func TestFindTimeoutWithRelays(t *testing.T) {
 
 func TestGrantCarriesRelays(t *testing.T) {
 	relay, host := bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)
-	keys := make([]string, 17)
+	keys := make([]string, 200)
 	for i := range keys {
 		keys[i] = hex.EncodeToString(bytes.Repeat([]byte{byte(10 + i)}, 32))
 	}
-	b, err := encodeGrant(strings.Repeat("ab", 16), make([]byte, 32), relay, host, strings.Repeat("<", 48), maxParticipantsCeiling, keys[:16])
+	b, err := encodeGrant(strings.Repeat("ab", 16), make([]byte, 32), relay, host, strings.Repeat("<", 48), maxParticipantsCeiling, keys)
 	if err != nil || len(b) > maxGrantBytes {
-		t.Fatalf("a grant with 16 relays and the longest name: %d bytes, %v", len(b), err)
+		t.Fatalf("a grant with 200 relays and the longest name: %d bytes, %v", len(b), err)
 	}
 	r, err := parseGrant(b)
-	if err != nil || len(r.relayKeys) != 16 || hex.EncodeToString(r.relayKeys[15]) != keys[15] {
+	if err != nil || len(r.relayKeys) != len(keys) || hex.EncodeToString(r.relayKeys[199]) != keys[199] {
 		t.Fatalf("parse: %v", err)
 	}
 	if b, _ = encodeGrant(strings.Repeat("ab", 16), make([]byte, 32), relay, host, "Ana", 8, nil); true {
@@ -209,7 +210,6 @@ func TestGrantCarriesRelays(t *testing.T) {
 	var g grant
 	json.Unmarshal(b, &g)
 	for name, list := range map[string][]string{
-		"17":        keys,
 		"duplicate": {keys[0], keys[1], keys[0]},
 		"short":     {"abcd"},
 		"uppercase": {strings.ToUpper(keys[0])},
