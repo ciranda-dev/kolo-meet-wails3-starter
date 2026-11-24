@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"slices"
 
 	kolomoq "github.com/ciranda-dev/kolo-moq"
 	koloswarm "github.com/ciranda-dev/kolo-swarm"
@@ -17,10 +16,9 @@ import (
 
 const (
 	grantVersion = 1
-	// maxGrantBytes: a grant is about 340 bytes, plus 67 for each of at most 16 connection relay keys (kolo-swarm
-	// Config.Relays holds at most 16); anything larger is not one.
-	maxGrantBytes = 2048
-	maxRelayKeys  = 16
+	// maxGrantBytes is the payload bound of kolo-invite (JoinOptions.MaxPayload default), which already refuses a larger
+	// accept; a grant is about 340 bytes plus 67 for each connection relay key.
+	maxGrantBytes = 1 << 20
 	topicLabel    = "kolo-meet/topic/v0"
 )
 
@@ -103,14 +101,13 @@ func parseGrant(b []byte) (*room, error) {
 	if g.Max < 2 || g.Max > maxParticipantsCeiling {
 		return nil, fmt.Errorf("%w: participant limit %d", ErrBadGrant, g.Max)
 	}
-	if len(g.Relays) > maxRelayKeys {
-		return nil, fmt.Errorf("%w: %d connection relays", ErrBadGrant, len(g.Relays))
-	}
-	var relayKeys [][]byte
+	relayKeys := make([][]byte, 0, len(g.Relays))
+	seen := make(map[string]bool, len(g.Relays))
 	for i, k := range g.Relays {
-		if !hex32.MatchString(k) || slices.Contains(g.Relays[:i], k) {
+		if !hex32.MatchString(k) || seen[k] {
 			return nil, fmt.Errorf("%w: connection relay %d", ErrBadGrant, i+1)
 		}
+		seen[k] = true
 		b, _ := hex.DecodeString(k)
 		relayKeys = append(relayKeys, b)
 	}

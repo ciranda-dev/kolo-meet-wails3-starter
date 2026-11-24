@@ -389,9 +389,6 @@ func FuzzParseGrant(f *testing.F) {
 			}
 			return
 		}
-		if len(r.relayKeys) > maxRelayKeys {
-			t.Fatalf("accepted %d relay keys", len(r.relayKeys))
-		}
 		for i, k := range r.relayKeys {
 			if len(k) != 32 || (i > 0 && slices.ContainsFunc(r.relayKeys[:i], func(x []byte) bool { return bytes.Equal(x, k) })) {
 				t.Fatalf("relay key %d of %q", i, b)
