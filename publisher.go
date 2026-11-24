@@ -194,8 +194,11 @@ func (p *publisher) onVideo(f *kolovideo.Frame, now time.Time) {
 	if noAdapt {
 		i = p.allowed // no controller to climb: the largest picture allowed, as the test seam promises
 	}
+	p.rungH = p.rungs[i].h
+	if j := p.sendingLocked(); j >= 0 && i > j && now.Sub(p.lastKey) < vpx.DefaultKeyframeInterval-frameEvery(p.vid.fps) {
+		i = j // a step up waits for the key frame the encoder is about to make, so it costs none of its own
+	}
 	r := p.rungs[i]
-	p.rungH = r.h
 	if f = p.scaled(f, r.w, r.h); f == nil {
 		return
 	}
@@ -262,6 +265,24 @@ func (p *publisher) onVideo(f *kolovideo.Frame, now time.Time) {
 	}
 }
 
+// sendingLocked is the index in p.rungs of the rung being encoded, -1 when none is.
+func (p *publisher) sendingLocked() int {
+	if p.venc == nil {
+		return -1
+	}
+	for i, r := range p.rungs {
+		if r.w == p.vw && r.h == p.vh {
+			return i
+		}
+	}
+	return -1
+}
+
+// frameEvery is the time between two camera frames at fps.
+func frameEvery(fps float64) time.Duration {
+	return time.Duration(float64(time.Second) / max(fps, 1))
+}
+
 // rateLocked is the bitrate of a w x h stream now: the size's full rate, scaled by what the path carries.
 func (p *publisher) rateLocked(w, h int) int {
 	full := fullRate(p.vid, w, h)
@@ -318,7 +339,7 @@ func (p *publisher) noteCost(px int, took time.Duration) {
 	p.costN++
 }
 
-// ladder returns the rungs for the camera and the call now, the index of the one being sent, and the index of the
+// ladder returns the rungs for the camera and the call now, the index of the one being encoded, and the index of the
 // highest one the engine, the receivers and the processor allow: one whose encode time, from the cost of a pixel, is under cpuShare of a
 // frame interval. The lowest rung always counts. Before the encoder has run costWarm frames nothing is ruled out.
 func (p *publisher) ladder() (rs []rung, cur, top int) {
@@ -335,7 +356,11 @@ func (p *publisher) ladder() (rs []rung, cur, top int) {
 			top--
 		}
 	}
-	return rs, min(p.rungIndexLocked(), p.allowed), top
+	cur = p.rungIndexLocked()
+	if j := p.sendingLocked(); j >= 0 {
+		cur = j // a step up asked for is not sent before the next key frame
+	}
+	return rs, min(cur, p.allowed), top
 }
 
 // setRung makes rung i of the last ladder() the one to send; the encoder is made again, with a key frame, at the next

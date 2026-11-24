@@ -351,9 +351,10 @@ func TestLadderBacksOffAfterAFailedStep(t *testing.T) {
 	if d := climbed(now); d < upHold || d > upHold+adaptEvery {
 		t.Errorf("first step up after %v, want %v", d, upHold)
 	}
-	// the step fails 1 s later: the queue is full and the path carries 500 kbit/s
+	// the step fails 1 s later: the queue is full and the path carries 2 Mbit/s, short of the 2.5 the rung needs but
+	// within what a rate grows to from there
 	now = now.Add(time.Second)
-	busy := decision{scale: 0.5, counted: 1, busy: true, est: 500e3, estAt: now}
+	busy := decision{scale: 0.5, counted: 1, busy: true, est: 2e6, estAt: now}
 	if next, _ := step(busy, cur); next != 0 {
 		t.Fatalf("a full queue at the rung above its estimate: rung %d", next)
 	}
@@ -514,7 +515,7 @@ func TestPublisherGuardsTheProcessor(t *testing.T) {
 		}
 	}
 	p.setRung(1)
-	p.onVideo(f, time.Now())
+	p.onVideo(f, time.Now().Add(vpx.DefaultKeyframeInterval))
 	if rs, cur, _ := p.ladder(); cur != 1 || p.vw != rs[1].w {
 		t.Errorf("rung 1 asked: at %d, encoding %dx%d", cur, p.vw, p.vh)
 	}
@@ -539,7 +540,7 @@ func TestPublisherNeverSendsMoreThanTheCamera(t *testing.T) {
 		rs, _, _ := p.ladder()
 		p.setRung(len(rs) - 1) // asks for the top, which cannot be more than the camera
 		for range 3 {
-			p.onVideo(f, time.Now())
+			p.onVideo(f, time.Now().Add(vpx.DefaultKeyframeInterval))
 		}
 		p.mu.Lock()
 		w, h := p.vw, p.vh
@@ -621,5 +622,186 @@ func BenchmarkShrink(b *testing.B) {
 				shrink(dst, src)
 			}
 		})
+	}
+}
+
+// A step up that fails while the path carries less than the rung needs, by more than a rate grows without a probe, puts
+// the rung out of reach: the next try waits the longest hold, not 4 times the first.
+func TestLadderCapsBelowARungOutOfReach(t *testing.T) {
+	rs := rungsOf(hd1080, 1920, 1080)
+	var l ladder
+	now := time.Unix(100, 0)
+	l.reset(now)
+	step := func(d decision, cur int) int {
+		now = now.Add(adaptEvery)
+		next, _ := l.step(now, rs, cur, 2, d)
+		return next
+	}
+	clear := decision{scale: 1, counted: 1}
+	cur := 0
+	for cur == 0 {
+		cur = step(clear, cur)
+	}
+	// 1280x720 needs 2.5 Mbit/s with the audio; the path carries 700 kbit/s, and 1.5 times that is 1.05
+	busy := decision{scale: 0.3, counted: 1, busy: true, est: 700e3, estAt: now.Add(adaptEvery)}
+	if cur = step(busy, cur); cur != 0 {
+		t.Fatalf("rung %d after the failed step", cur)
+	}
+	from := now
+	for cur == 0 && now.Sub(from) < 3*time.Minute {
+		cur = step(clear, cur)
+	}
+	if d := now.Sub(from); d < maxBackoff*upHold || d > maxBackoff*upHold+adaptEvery {
+		t.Errorf("the next try came after %v, want %v", d, maxBackoff*upHold)
+	}
+}
+
+// Each rung keeps its own count of failed tries: the middle rung holding for a whole trial does not clear the count of
+// the top one, which keeps failing.
+func TestLadderCountsTheFailuresOfEachRung(t *testing.T) {
+	rs := rungsOf(hd1080, 1920, 1080)
+	var l ladder
+	now := time.Unix(100, 0)
+	l.reset(now)
+	clear := decision{scale: 1, counted: 1}
+	cur := 0
+	climb := func() time.Duration {
+		from := now
+		for start := cur; cur == start; {
+			now = now.Add(adaptEvery)
+			cur, _ = l.step(now, rs, cur, 2, clear)
+			if now.Sub(from) > 5*time.Minute {
+				t.Fatal("never climbed")
+			}
+		}
+		return now.Sub(from)
+	}
+	climb()
+	now = now.Add(trial) // the middle rung lasts a trial
+	climb()
+	for range 2 { // the top fails twice, each time within reach, and the middle rung lasts a trial in between
+		now = now.Add(time.Second)
+		busy := decision{scale: 0.5, counted: 1, busy: true, est: 3.5e6, estAt: now}
+		if cur, _ = l.step(now, rs, cur, 2, busy); cur != 1 {
+			t.Fatalf("rung %d after a failure at the top", cur)
+		}
+		now = now.Add(trial)
+		if d := climb(); cur != 2 {
+			t.Fatalf("rung %d after %v", cur, d)
+		}
+	}
+	now = now.Add(time.Second)
+	if cur, _ = l.step(now, rs, cur, 2, decision{scale: 0.5, counted: 1, busy: true, est: 3.5e6, estAt: now}); cur != 1 {
+		t.Fatalf("rung %d after the third failure", cur)
+	}
+	from := now
+	climb()
+	if d := now.Sub(from); d < holdBackoff*holdBackoff*holdBackoff*upHold && d < maxBackoff*upHold {
+		t.Errorf("after three failures of the top the next try came after %v", d)
+	}
+}
+
+// A step up waits for the key frame the encoder makes every vpx.DefaultKeyframeInterval: the new size starts with that
+// one instead of adding its own. A step down does not wait.
+func TestPublisherStepsUpOnTheKeyFrame(t *testing.T) {
+	old := ladderHeights
+	ladderHeights = []int{90, 180}
+	t.Cleanup(func() { ladderHeights = old })
+	p := testPublisher(t, videoMode{w: 320, h: 180, fps: 30})
+	f, _ := kolovideo.NewFrame(320, 180)
+	now := time.Now()
+	p.onVideo(f, now) // the first frame: a key frame at the lowest rung
+	size := func() int {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.vh
+	}
+	p.setRung(1)
+	for el := time.Duration(0); el < vpx.DefaultKeyframeInterval-2*frameEvery(30); el += frameEvery(30) {
+		p.onVideo(f, now.Add(el))
+		if h := size(); h != 90 {
+			t.Fatalf("at %v, before the key frame is due, encoding %dp", el, h)
+		}
+		if _, cur, _ := p.ladder(); cur != 0 {
+			t.Fatalf("at %v the ladder is told rung %d, which is not sent yet", el, cur)
+		}
+	}
+	p.mu.Lock()
+	keys := p.nkey
+	p.mu.Unlock()
+	p.onVideo(f, now.Add(vpx.DefaultKeyframeInterval))
+	if h := size(); h != 180 {
+		t.Fatalf("encoding %dp when the key frame is due", h)
+	}
+	p.mu.Lock()
+	if p.nkey != keys+1 {
+		t.Errorf("%d key frames for the step up, want 1", p.nkey-keys)
+	}
+	p.mu.Unlock()
+	p.setRung(0)
+	p.onVideo(f, now.Add(vpx.DefaultKeyframeInterval+frameEvery(30)))
+	if h := size(); h != 90 {
+		t.Errorf("a step down waits: encoding %dp", h)
+	}
+}
+
+// A step up is sent with the encoder's next key frame: a step down before that is no failed try of the rung, and the
+// trial of the rung begins when it is sent.
+func TestLadderTrialBeginsWhenTheStepIsSent(t *testing.T) {
+	rs := rungsOf(hd1080, 1920, 1080)
+	var l ladder
+	now := time.Unix(100, 0)
+	l.reset(now)
+	clear := decision{scale: 1, counted: 1}
+	next := 1
+	for next == 1 {
+		now = now.Add(adaptEvery)
+		next, _ = l.step(now, rs, 1, 2, clear)
+	}
+	// still encoding rung 1 when the path fills: the step down lowers the request, and rung 2 was never tried
+	now = now.Add(adaptEvery)
+	if n, _ := l.step(now, rs, 1, 2, decision{scale: 0.5, counted: 1, busy: true, est: 700e3, estAt: now}); n != 0 {
+		t.Fatalf("rung %d", n)
+	}
+	if n := *l.tried(2); n != 0 {
+		t.Fatalf("%d failed tries of a rung that was not sent", n)
+	}
+	// rung 1 is asked for, and sent after 1.5 s; a step down 20.5 s after the decision but 19 s after it was sent is a
+	// failed try
+	next = 0
+	for next == 0 {
+		now = now.Add(adaptEvery)
+		next, _ = l.step(now, rs, 0, 2, clear)
+	}
+	for range 6 {
+		now = now.Add(adaptEvery)
+		l.step(now, rs, 0, 2, clear)
+	}
+	sent := now
+	for now.Sub(sent) < trial-time.Second { // the processor allows no more than rung 1
+		now = now.Add(adaptEvery)
+		l.step(now, rs, 1, 1, clear)
+	}
+	if n, _ := l.step(now, rs, 1, 1, decision{scale: 0.5, counted: 1, busy: true, est: 2e6, estAt: now}); n != 0 || *l.tried(1) != 1 {
+		t.Fatalf("rung %d, %d failed tries after a step down within the trial", n, *l.tried(1))
+	}
+}
+
+// The counts of failed tries are for the rungs they were made on: when the rungs change (people join, the camera
+// changes) they are forgotten.
+func TestLadderForgetsTheCountsOfOtherRungs(t *testing.T) {
+	rs := rungsOf(hd1080, 1920, 1080)
+	var l ladder
+	now := time.Unix(100, 0)
+	l.reset(now)
+	l.step(now, rs, 0, 2, decision{scale: 1, counted: 1})
+	*l.tried(1) = maxTries
+	if l.hold(1) != maxBackoff*upHold {
+		t.Fatalf("hold %v", l.hold(1))
+	}
+	now = now.Add(adaptEvery)
+	l.step(now, rungsOf(hd1080, 1280, 720), 0, 1, decision{scale: 1, counted: 1})
+	if h := l.hold(1); h != upHold {
+		t.Errorf("hold %v for the rungs of another camera, want %v", h, upHold)
 	}
 }

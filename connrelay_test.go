@@ -176,7 +176,7 @@ func TestFindTimeoutWithRelays(t *testing.T) {
 		want time.Duration
 	}{
 		{Config{}, defaultFindTimeout},
-		{Config{Relays: []string{a}}, 195 * time.Second},
+		{Config{Relays: []string{a}}, 72 * time.Second},
 		{Config{Relays: []string{a}, FindTimeout: 9 * time.Second}, 9 * time.Second},
 	} {
 		c.cfg.DataDir = t.TempDir()

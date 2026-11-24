@@ -9,9 +9,11 @@ import (
 	"runtime/pprof"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	kolomedia "github.com/ciranda-dev/kolo-media"
 	"github.com/ciranda-dev/kolo-meet-wails3-starter/internal/netsim"
 	kolomoq "github.com/ciranda-dev/kolo-moq"
 	kolosecure "github.com/ciranda-dev/kolo-secure"
@@ -29,6 +31,7 @@ type impairment struct {
 	cutFor   time.Duration
 	video    videoMode // the call's video setting; the zero value is hd
 	slow     bool      // only measured when KOLO_MEET_SLOW is set: the call comes through without help
+	cc       string    // the congestion controller of both people, the default when empty
 	// events change the link while the call runs, at a time since the start of the sampling.
 	events []linkEvent
 }
@@ -163,7 +166,7 @@ func callThrough(t *testing.T, im impairment, dur time.Duration) outcome {
 		p.rec.waitNetwork(t, netReady)
 		return p
 	}
-	host, guest := mk(0, Config{First: first}), mk(1, Config{Bootstrap: first})
+	host, guest := mk(0, Config{First: first, Congestion: im.cc}), mk(1, Config{Bootstrap: first, Congestion: im.cc})
 	host.turnOn(t)
 	if _, err := host.CreateCall(); err != nil {
 		t.Fatal(err)
@@ -177,7 +180,9 @@ func callThrough(t *testing.T, im impairment, dur time.Duration) outcome {
 	t.Cleanup(func() { link.Close() })
 	relayHook = func(c *call, conn kolomoq.Conn) kolomoq.Conn {
 		conn.Close()
-		d, err := kolosecure.Dial(c.ctx, link.Addr(), c.svc.id, hc.relID, &kolosecure.Config{Transport: transportConfig()})
+		tc := transportConfig()
+		tc.CongestionControl = c.svc.settingsCopy().Congestion
+		d, err := kolosecure.Dial(c.ctx, link.Addr(), c.svc.id, hc.relID, &kolosecure.Config{Transport: tc})
 		if err != nil {
 			t.Logf("dial through the link: %v", err) // a reconnection during an outage fails, and tries again
 			return conn
@@ -347,6 +352,195 @@ func TestImpairedReport(t *testing.T) {
 
 var _ = context.Background
 
+// relayedPath is the path of the field test of 2026-11-20 between two countries through a connection relay: 470 ms
+// round trip, up to 40 ms more each way, 1 Mbit/s in each direction and a queue of a second, since a relayed stream
+// turns a lost packet into delay rather than loss.
+func relayedPath() (up, down netsim.Profile) {
+	p := netsim.Profile{Rate: 1 * mbps, Queue: 1 * mbps, Delay: 235 * time.Millisecond, Jitter: 40 * time.Millisecond, Seed: 1}
+	q := p
+	q.Seed = 2
+	return p, q
+}
+
+// pathTick is one tick of a sender's adapter: what it decided, the height it encodes and the key frames written so far.
+type pathTick struct {
+	at   time.Duration
+	d    decision
+	h    int
+	keys uint64
+}
+
+// sideTrace is what one person's sender did over a run, and the playout delay of the person who received it.
+type sideTrace struct {
+	ticks   []pathTick
+	changes []ladderRung
+	delays  []time.Duration
+}
+
+// pathRecorder follows, through the test seams, the adapter, the ladder and the receiving playout of both people of a
+// call, by the role of the sender.
+type pathRecorder struct {
+	mu    sync.Mutex
+	begin time.Time
+	sides map[string]*sideTrace
+}
+
+func recordPaths(t *testing.T) *pathRecorder {
+	r := &pathRecorder{begin: time.Now(), sides: map[string]*sideTrace{roleHost: {}, roleGuest: {}}}
+	pathDecided = func(c *call, d decision) {
+		h, keys := 0, uint64(0)
+		if pub := c.publisher(); pub != nil {
+			pub.mu.Lock()
+			h, keys = pub.vh, pub.nkey
+			pub.mu.Unlock()
+		}
+		r.mu.Lock()
+		s := r.sides[c.role]
+		s.ticks = append(s.ticks, pathTick{time.Since(r.begin), d, h, keys})
+		r.mu.Unlock()
+	}
+	rungChanged = func(c *call, g rung, why string) {
+		r.mu.Lock()
+		s := r.sides[c.role]
+		s.changes = append(s.changes, ladderRung{time.Since(r.begin), g.h, why})
+		r.mu.Unlock()
+	}
+	watchSampled = func(c *call, p *participant, st kolomedia.WatchStats) {
+		from := roleHost
+		if c.role == roleHost {
+			from = roleGuest
+		}
+		r.mu.Lock()
+		s := r.sides[from]
+		s.delays = append(s.delays, st.Playout.Delay)
+		r.mu.Unlock()
+	}
+	t.Cleanup(func() { pathDecided, rungChanged, watchSampled = nil, nil, nil })
+	return r
+}
+
+// firstEstimate is the first estimate of the path a sender's adapter made after its sessions counted, and when.
+func (s *sideTrace) firstEstimate() (float64, time.Duration) {
+	for _, x := range s.ticks {
+		if x.d.est > 0 {
+			return x.d.est, x.at
+		}
+	}
+	return 0, -1
+}
+
+// flaps counts the steps up that were followed by a step down within trial.
+func (s *sideTrace) flaps() (n int) {
+	for i := 1; i < len(s.changes); i++ {
+		if s.changes[i].h < s.changes[i-1].h && s.changes[i].at-s.changes[i-1].at < trial && (i == 1 || s.changes[i-1].h > s.changes[i-2].h) {
+			n++
+		}
+	}
+	return n
+}
+
+// keysPerMinute is the key frames a sender wrote a minute, from its first tick with media to its last.
+func (s *sideTrace) keysPerMinute() float64 {
+	first, last := -1, len(s.ticks)-1
+	for i, x := range s.ticks {
+		if x.keys > 0 {
+			first = i
+			break
+		}
+	}
+	if first < 0 || last <= first {
+		return 0
+	}
+	d := s.ticks[last].at - s.ticks[first].at
+	return float64(s.ticks[last].keys-s.ticks[first].keys) / d.Minutes()
+}
+
+// atCap is the share of the playout's samples at or over cap.
+func (s *sideTrace) atCap(cap time.Duration) float64 {
+	if len(s.delays) == 0 {
+		return 0
+	}
+	n := 0
+	for _, d := range s.delays {
+		if d >= cap {
+			n++
+		}
+	}
+	return float64(n) / float64(len(s.delays))
+}
+
+// slowWindows counts the windows of 5 s, from from to the end, in which fewer than 15 pictures a second were decoded.
+func slowWindows(s []sample, from, to time.Duration) (n, of int) {
+	for a := from; a+5*time.Second <= to; a += 5 * time.Second {
+		of++
+		if rate(s, a, a+5*time.Second, true) < 15 {
+			n++
+		}
+	}
+	return n, of
+}
+
+// report is the timeline of one sender, a line every 5 s, for the log.
+func (s *sideTrace) report(name string, recv []sample, dur time.Duration) string {
+	var b strings.Builder
+	est, at := s.firstEstimate()
+	maxDelay := time.Duration(0)
+	for _, d := range s.delays {
+		maxDelay = max(maxDelay, d)
+	}
+	n, of := slowWindows(recv, settle, dur)
+	fmt.Fprintf(&b, "%s: first estimate %.0f kbit/s at %.1fs, %d rung changes, %d flaps, %.1f key frames a minute, playout delay max %v and at 400 ms or more %.0f%% of the time, %d of %d windows of 5 s under 15 pictures a second\n",
+		name, est/1000, at.Seconds(), len(s.changes), s.flaps(), s.keysPerMinute(), maxDelay, 100*s.atCap(400*time.Millisecond), n, of)
+	next := time.Duration(0)
+	for _, x := range s.ticks {
+		if x.at < next {
+			continue
+		}
+		next = x.at + 5*time.Second
+		fmt.Fprintf(&b, "  %5.1fs est %6.0f kbit/s scale %3.0f%% busy %-5v %4dp keys %d\n", x.at.Seconds(), x.d.est/1000, x.d.scale*100, x.d.busy, x.h, x.keys)
+	}
+	for _, c := range s.changes {
+		fmt.Fprintf(&b, "  %5.1fs -> %dp (%s)\n", c.at.Seconds(), c.h, c.why)
+	}
+	return b.String()
+}
+
+// TestRelayedPathReport measures a call over the relayed path of the field test and prints, for each sender, the
+// estimate of the path over time, the rung changes, the key frames a minute, the playout delay and the frame rate, with
+// the owner's 1280x720 setting; set KOLO_MEET_RELAYED=<seconds>, KOLO_MEET_RELAYED_CC=reno,bbr to compare controllers and
+// KOLO_MEET_RELAYED_SMALL=1 for the small pictures of the ladder tests.
+func TestRelayedPathReport(t *testing.T) {
+	v := os.Getenv("KOLO_MEET_RELAYED")
+	if v == "" {
+		t.Skip("set KOLO_MEET_RELAYED=<seconds> to measure")
+	}
+	dur, err := time.ParseDuration(v + "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loadCodecs(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	ccs := splitList(os.Getenv("KOLO_MEET_RELAYED_CC"))
+	if len(ccs) == 0 {
+		ccs = []string{""}
+	}
+	for _, cc := range ccs {
+		t.Run("cc="+cc, func(t *testing.T) {
+			up, down := relayedPath()
+			r := recordPaths(t)
+			vid := hd
+			if os.Getenv("KOLO_MEET_RELAYED_SMALL") != "" {
+				vid = ladderVideo(t)
+			}
+			o := callThrough(t, impairment{name: "relayed 470ms", up: up, down: down, cc: cc, video: vid}, dur)
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			t.Log("\n" + o.report("relayed 470ms", dur) + "\n" + r.sides[roleHost].report("host", o.atGuest, dur) + r.sides[roleGuest].report("guest", o.atHost, dur))
+		})
+	}
+}
+
 // settle is how long a call has to find its rate before a test counts what it carries.
 const settle = 6 * time.Second
 
@@ -401,5 +595,35 @@ func TestCallOverAnImpairedLink(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Over the relayed path of the field test the camera tries the rung the path cannot carry once and stays below it,
+// instead of stepping up and down again after 4, 16 and 64 s, and the pictures keep coming at both ends.
+func TestRelayedPathSettles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("takes 50 s")
+	}
+	if err := loadCodecs(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	const dur = 50 * time.Second
+	up, down := relayedPath()
+	r := recordPaths(t)
+	o := callThrough(t, impairment{name: "relayed 470ms", up: up, down: down, video: ladderVideo(t)}, dur)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t.Log("\n" + o.report("relayed 470ms", dur) + "\n" + r.sides[roleHost].report("host", o.atGuest, dur) + r.sides[roleGuest].report("guest", o.atHost, dur))
+	for _, who := range []struct {
+		role string
+		recv []sample
+	}{{roleHost, o.atGuest}, {roleGuest, o.atHost}} {
+		s := r.sides[who.role]
+		if n := s.flaps(); n > 1 {
+			t.Errorf("%s: %d steps up that failed within %v, want at most 1", who.role, n, trial)
+		}
+		if v := rate(who.recv, dur-2*settle, dur, true); v < 10 {
+			t.Errorf("%s: %.1f pictures a second at the end, want 10 of 30", who.role, v)
+		}
 	}
 }
